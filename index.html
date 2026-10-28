@@ -1,0 +1,752 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Randal Analytics Pro M2 - Compact</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800;900&display=swap');
+        body {
+            font-family: 'Plus Jakarta Sans', sans-serif;
+            background-color: #f8fafc;
+        }
+        .glass-card {
+            background: #ffffff;
+            border: 1px solid #e2e8f0;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+        }
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 4px;
+            height: 4px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background-color: #cbd5e1;
+            border-radius: 10px;
+        }
+        input, select, textarea {
+            font-size: 0.875rem !important;
+        }
+    </style>
+
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, addDoc, onSnapshot, query, deleteDoc, doc, writeBatch, serverTimestamp, updateDoc, setDoc, Timestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Configuración de Firebase con respaldo para entorno local
+        const firebaseConfig = typeof __firebase_config !== 'undefined' 
+            ? JSON.parse(__firebase_config) 
+            : {
+                apiKey: "demo-api-key",
+                authDomain: "demo-app.firebaseapp.com",
+                projectId: "demo-app",
+                storageBucket: "demo-app.appspot.com",
+                messagingSenderId: "123456789",
+                appId: "1:123456789:web:demo"
+              };
+
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'muebles-pro-m2';
+
+        let currentUser = null;
+        let editingId = null;
+        let allRecords = [];
+        let filteredRecords = [];
+        let persistedMaterials = [];
+        let persistedReasons = [];
+        let mainChart = null;
+        let impactChart = null;
+        let currentMonthFilter = "all";
+
+        const initAuth = async () => {
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (e) {
+                console.error("Auth Error:", e);
+                showMessage("Error de conexión", "error");
+            }
+        };
+
+        onAuthStateChanged(auth, (user) => {
+            if (user) {
+                currentUser = user;
+                document.getElementById('user-info').textContent = `ID: ${user.uid.substring(0,8)}`;
+                setupRealtimeListeners();
+            }
+        });
+
+        function setupRealtimeListeners() {
+            if (!currentUser) return;
+
+            // Escuchar registros de mermas y rechazos
+            const recordsRef = collection(db, 'artifacts', appId, 'public', 'data', 'registros');
+            onSnapshot(recordsRef, (snapshot) => {
+                allRecords = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                allRecords.sort((a, b) => (b.timestamp?.seconds || 0) - (a.timestamp?.seconds || 0));
+                updateMonthSelectorOptions();
+                applyFilters();
+            }, (err) => {
+                console.error("Firestore Error (registros):", err);
+            });
+
+            // Escuchar catálogo de materiales
+            const materialsRef = collection(db, 'artifacts', appId, 'public', 'data', 'materiales_lista');
+            onSnapshot(materialsRef, (snapshot) => {
+                persistedMaterials = snapshot.docs.map(doc => ({id: doc.id, name: doc.data().name}));
+                updateDatalists();
+            }, (err) => console.error("Firestore Error (materiales):", err));
+
+            // Escuchar catálogo de motivos
+            const reasonsRef = collection(db, 'artifacts', appId, 'public', 'data', 'motivos_lista');
+            onSnapshot(reasonsRef, (snapshot) => {
+                persistedReasons = snapshot.docs.map(doc => ({id: doc.id, name: doc.data().name}));
+                updateDatalists();
+            }, (err) => console.error("Firestore Error (motivos):", err));
+        }
+
+        initAuth();
+
+        window.setMonthFilter = (val) => {
+            currentMonthFilter = val;
+            applyFilters();
+        };
+
+        function updateMonthSelectorOptions() {
+            const monthsSet = new Set();
+            allRecords.forEach(r => {
+                if (r.timestamp && r.timestamp.seconds) {
+                    const date = new Date(r.timestamp.seconds * 1000);
+                    const monthYear = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+                    monthsSet.add(monthYear);
+                }
+            });
+
+            const selector = document.getElementById('month-filter-select');
+            if (!selector) return;
+
+            const currentVal = currentMonthFilter;
+            const sortedMonths = Array.from(monthsSet).sort().reverse();
+
+            selector.innerHTML = `<option value="all">Todo el Historial</option>` +
+                sortedMonths.map(m => {
+                    const [year, month] = m.split('-');
+                    const dateName = new Date(year, month - 1).toLocaleString('es-ES', { month: 'long', year: 'numeric' });
+                    return `<option value="${m}">${dateName.charAt(0).toUpperCase() + dateName.slice(1)}</option>`;
+                }).join('');
+
+            selector.value = currentVal;
+        }
+
+        function applyFilters() {
+            if (currentMonthFilter === "all") {
+                filteredRecords = [...allRecords];
+            } else {
+                filteredRecords = allRecords.filter(r => {
+                    if (!r.timestamp) return false;
+                    const date = new Date(r.timestamp.seconds * 1000);
+                    const monthYear = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+                    return monthYear === currentMonthFilter;
+                });
+            }
+            updateDashboard();
+        }
+
+        function updateDatalists() {
+            const materials = persistedMaterials.map(m => m.name).sort();
+            const reasons = persistedReasons.map(m => m.name).sort();
+            document.getElementById('list-materiales').innerHTML = materials.map(m => `<option value="${m}">`).join('');
+            document.getElementById('list-motivos').innerHTML = reasons.map(m => `<option value="${m}">`).join('');
+            
+            if (!document.getElementById('lists-modal').classList.contains('hidden')) {
+                renderManageableLists();
+            }
+            updateCalculatorSelects();
+        }
+
+        async function persistMetadata(material, motivo) {
+            if (!currentUser) return;
+            try {
+                if (material && material !== 'No especificado' && !persistedMaterials.some(m => m.name.toLowerCase() === material.toLowerCase())) {
+                    const id = 'mat_' + Date.now();
+                    await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'materiales_lista', id), { name: material });
+                }
+                if (motivo && !persistedReasons.some(r => r.name.toLowerCase() === motivo.toLowerCase())) {
+                    const id = 'mot_' + Date.now();
+                    await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'motivos_lista', id), { name: motivo });
+                }
+            } catch (e) { console.error("Error persistiendo metadata", e); }
+        }
+
+        window.saveData = async () => {
+            if (!currentUser) {
+                showMessage("Autenticando...", "error");
+                return;
+            }
+
+            const matRaw = document.getElementById('f_material').value.trim() || 'No especificado';
+            const motRaw = document.getElementById('f_motivo').value.trim();
+            const dateVal = document.getElementById('f_fecha').value;
+            
+            const m2Input = parseFloat(document.getElementById('f_m2').value) || 0;
+            const cantidad = parseInt(document.getElementById('f_cantidad').value) || 1;
+
+            if (!motRaw) {
+                showMessage("Falta el motivo", "error");
+                return;
+            }
+
+            if (m2Input <= 0) {
+                showMessage("Falta el valor de m²", "error");
+                return;
+            }
+
+            const superficie = m2Input * cantidad;
+            
+            let finalTimestamp = serverTimestamp();
+            if (dateVal) {
+                const localDate = new Date(dateVal + 'T12:00:00');
+                finalTimestamp = Timestamp.fromDate(localDate);
+            }
+
+            const data = {
+                pedido: document.getElementById('f_pedido').value.trim() || 'N/A',
+                cantidad,
+                tipo: document.getElementById('f_tipo').value,
+                motivo: motRaw,
+                material: matRaw,
+                notas: document.getElementById('f_notas').value.trim(),
+                m2: parseFloat(superficie.toFixed(4)),
+                timestamp: finalTimestamp,
+                lastModified: serverTimestamp()
+            };
+
+            try {
+                await persistMetadata(matRaw, motRaw);
+
+                if (editingId) {
+                    await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'registros', editingId), data);
+                    showMessage("Actualizado correctamente");
+                    cancelEdit();
+                } else {
+                    data.userId = currentUser.uid;
+                    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'registros'), data);
+                    showMessage("Registrado con éxito");
+                    resetForm();
+                }
+            } catch (e) { 
+                console.error("Error al guardar:", e);
+                showMessage("Error al guardar en base de datos", "error"); 
+            }
+        };
+
+        window.editRecord = (id) => {
+            const r = allRecords.find(x => x.id === id);
+            if (!r) return;
+            editingId = id;
+            document.getElementById('f_pedido').value = r.pedido === 'N/A' ? '' : r.pedido;
+            
+            // Cargar los m2 divididos entre la cantidad para mostrar el m2 unitario original
+            const cant = r.cantidad || 1;
+            document.getElementById('f_m2').value = (r.m2 / cant).toFixed(4) || '';
+            document.getElementById('f_cantidad').value = cant;
+            
+            document.getElementById('f_tipo').value = r.tipo || 'Merma';
+            document.getElementById('f_motivo').value = r.motivo || '';
+            document.getElementById('f_material').value = r.material === 'No especificado' ? '' : r.material;
+            document.getElementById('f_notas').value = r.notas || '';
+            
+            if (r.timestamp && r.timestamp.seconds) {
+                const d = new Date(r.timestamp.seconds * 1000);
+                document.getElementById('f_fecha').value = d.toISOString().split('T')[0];
+            }
+
+            document.getElementById('submit-text').textContent = "GUARDAR CAMBIOS";
+            document.getElementById('btn-cancel').classList.remove('hidden');
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+        };
+
+        window.cancelEdit = () => {
+            editingId = null;
+            resetForm();
+            document.getElementById('submit-text').textContent = "REGISTRAR";
+            document.getElementById('btn-cancel').classList.add('hidden');
+        };
+
+        window.confirmDelete = (id) => { window.recordToDelete = id; showModal('single-delete-modal'); };
+        window.deleteSingle = async () => {
+            if (!currentUser) return;
+            try {
+                await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'registros', window.recordToDelete));
+                hideModal('single-delete-modal');
+                showMessage("Eliminado correctamente");
+            } catch (e) {
+                console.error(e);
+                showMessage("Error al eliminar", "error");
+            }
+        };
+
+        function updateDashboard() {
+            let tMerma = 0, tRechazo = 0;
+            const motivosM2 = {};
+            const motivosCount = {};
+            const tiposCount = { 'Merma': 0, 'Rechazo': 0 };
+
+            filteredRecords.forEach(r => {
+                if (r.tipo === 'Merma') tMerma += r.m2;
+                else tRechazo += r.m2;
+                
+                if (tiposCount[r.tipo] !== undefined) tiposCount[r.tipo] += r.m2;
+                
+                motivosM2[r.motivo] = (motivosM2[r.motivo] || 0) + r.m2;
+                motivosCount[r.motivo] = (motivosCount[r.motivo] || 0) + 1;
+            });
+
+            const totalGlobalM2 = tMerma + tRechazo;
+            const totalRecords = filteredRecords.length;
+
+            document.getElementById('stat-merma').textContent = tMerma.toFixed(2);
+            document.getElementById('stat-rechazo').textContent = tRechazo.toFixed(2);
+            document.getElementById('stat-total').textContent = totalGlobalM2.toFixed(2);
+            document.getElementById('current-period-label').textContent = currentMonthFilter === "all" ? "Historial General" : `Periodo: ${currentMonthFilter}`;
+
+            renderTable();
+            renderMainChart(motivosM2);
+            renderPercentages(totalGlobalM2, tiposCount, motivosM2);
+            renderFrequencyPanel(totalRecords, motivosCount);
+            updateCalculatorSelects();
+            window.updateImpact();
+        }
+
+        function renderTable() {
+            const body = document.getElementById('table-body');
+            if (filteredRecords.length === 0) {
+                body.innerHTML = `<tr><td colspan="4" class="p-6 text-center text-slate-400 text-xs italic">Sin registros para el periodo seleccionado</td></tr>`;
+                return;
+            }
+            body.innerHTML = filteredRecords.map(r => `
+                <tr class="border-b border-slate-100 hover:bg-slate-50 transition">
+                    <td class="p-2">
+                        <div class="text-[10px] font-bold text-slate-700 break-words">${r.pedido}</div>
+                        <div class="text-[9px] text-slate-400">${r.timestamp && r.timestamp.seconds ? new Date(r.timestamp.seconds * 1000).toLocaleDateString('es-ES') : 'S/F'}</div>
+                    </td>
+                    <td class="p-2">
+                         <div class="text-[10px] font-semibold text-blue-600 break-words">${r.material}</div>
+                         <div class="text-[9px] text-slate-500 break-words">${r.motivo}</div>
+                    </td>
+                    <td class="p-2 text-right font-mono font-bold text-[10px]">${r.m2.toFixed(2)} m²</td>
+                    <td class="p-2 text-right">
+                        <div class="flex justify-end gap-2">
+                            <button onclick="editRecord('${r.id}')" title="Editar" class="text-slate-400 hover:text-blue-600 p-1"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" stroke-width="2"/></svg></button>
+                            <button onclick="confirmDelete('${r.id}')" title="Eliminar" class="text-slate-400 hover:text-red-600 p-1"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" stroke-width="2"/></svg></button>
+                        </div>
+                    </td>
+                </tr>
+            `).join('');
+        }
+
+        function renderMainChart(dataMap) {
+            const ctx = document.getElementById('motivosChart');
+            if (!ctx) return;
+            if (mainChart) mainChart.destroy();
+            const labels = Object.keys(dataMap);
+            if (labels.length === 0) {
+                mainChart = null;
+                return;
+            }
+            mainChart = new Chart(ctx, {
+                type: 'doughnut',
+                data: { labels, datasets: [{ data: Object.values(dataMap), backgroundColor: ['#3b82f6', '#ef4444', '#f59e0b', '#10b981', '#6366f1', '#ec4899', '#8b5cf6', '#14b8a6'], borderWidth: 0 }] },
+                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, cutout: '75%' }
+            });
+        }
+
+        function renderPercentages(total, tipos, motivos) {
+            const cTipos = document.getElementById('percent-tipos');
+            const cMotivos = document.getElementById('percent-motivos');
+            if (total === 0) {
+                cTipos.innerHTML = cMotivos.innerHTML = '<p class="text-[10px] text-slate-400 text-center py-4">Sin datos</p>';
+                return;
+            }
+
+            cTipos.innerHTML = Object.entries(tipos).map(([tipo, m2]) => {
+                const perc = ((m2 / total) * 100).toFixed(0);
+                const color = tipo === 'Merma' ? 'bg-amber-500' : 'bg-red-500';
+                return `<div class="mb-2"><div class="flex justify-between text-[9px] font-bold text-slate-500 uppercase"><span>${tipo}</span><span>${perc}% (${m2.toFixed(1)} m²)</span></div><div class="w-full bg-slate-100 h-1.5 rounded-full overflow-hidden mt-1"><div class="${color} h-full rounded-full" style="width: ${perc}%"></div></div></div>`;
+            }).join('');
+            
+            cMotivos.innerHTML = Object.entries(motivos).sort((a,b)=>b[1]-a[1]).slice(0, 5).map(([mot, m2]) => {
+                const perc = ((m2/total)*100).toFixed(0);
+                return `<div class="mb-2"><div class="flex justify-between text-[9px] font-bold text-slate-500 truncate"><span class="truncate pr-2">${mot}</span><span>${perc}%</span></div><div class="w-full bg-slate-100 h-1.5 rounded-full overflow-hidden mt-1"><div class="bg-slate-800 h-full rounded-full" style="width: ${perc}%"></div></div></div>`;
+            }).join('');
+        }
+
+        function renderFrequencyPanel(total, counts) {
+            const container = document.getElementById('frequency-grid');
+            if (total === 0) {
+                container.innerHTML = '<p class="col-span-full text-[10px] text-slate-400 text-center py-4 italic">No hay suficientes datos</p>';
+                return;
+            }
+
+            const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 3);
+            container.innerHTML = sorted.map(([mot, count]) => {
+                const perc = ((count / total) * 100).toFixed(0);
+                return `
+                    <div class="bg-slate-50 p-2.5 rounded-lg border border-slate-100 flex flex-col justify-between">
+                        <div class="text-[8px] font-black text-blue-600 uppercase break-words overflow-visible leading-[1.2] truncate">${mot}</div>
+                        <div class="text-base font-black text-slate-900 leading-tight mt-1">${perc}% <span class="text-[9px] font-normal text-slate-400">(${count})</span></div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function updateCalculatorSelects() {
+            const sel = document.getElementById('calc_mat');
+            if (!sel) return;
+            const val = sel.value;
+            const mats = persistedMaterials.map(m => m.name).filter(m => m !== 'No especificado').sort();
+            sel.innerHTML = '<option value="">Material...</option>' + mats.map(m => `<option value="${m}">${m}</option>`).join('');
+            sel.value = val;
+        }
+
+        window.updateImpact = () => {
+            const mat = document.getElementById('calc_mat').value;
+            const total = parseFloat(document.getElementById('calc_total').value) || 0;
+            if (!mat || total <= 0) {
+                document.getElementById('calc-result').textContent = "0.0%";
+                renderImpactChart(0);
+                return;
+            }
+            const loss = filteredRecords.filter(r => r.material === mat).reduce((acc, curr) => acc + curr.m2, 0);
+            const perc = Math.min(100, (loss / total) * 100);
+            document.getElementById('calc-result').textContent = `${perc.toFixed(1)}%`;
+            renderImpactChart(perc);
+        };
+
+        function renderImpactChart(percentage) {
+            const ctx = document.getElementById('impactChart');
+            if (!ctx) return;
+            if (impactChart) impactChart.destroy();
+            impactChart = new Chart(ctx, {
+                type: 'doughnut',
+                data: { datasets: [{ data: [percentage, Math.max(0, 100 - percentage)], backgroundColor: ['#3b82f6', '#e2e8f0'], borderWidth: 0 }] },
+                options: { 
+                    responsive: true, 
+                    maintainAspectRatio: false, 
+                    cutout: '80%', 
+                    rotation: 270,
+                    circumference: 180,
+                    plugins: { tooltip: { enabled: false }, legend: { display: false } } 
+                }
+            });
+        }
+
+        function resetForm() {
+            ['f_pedido', 'f_m2', 'f_cantidad', 'f_notas', 'f_material', 'f_motivo', 'f_fecha'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.value = '';
+            });
+            document.getElementById('f_cantidad').value = 1;
+            document.getElementById('f_tipo').value = 'Merma';
+        }
+
+        function showMessage(msg, type = "success") {
+            const banner = document.getElementById('msg-banner');
+            banner.textContent = msg;
+            banner.className = `fixed bottom-4 right-4 px-4 py-2.5 rounded-xl text-white text-xs font-bold shadow-2xl transition-all z-[100] ${type === 'success' ? 'bg-slate-900 border border-slate-700' : 'bg-red-600'}`;
+            banner.classList.remove('translate-y-20', 'opacity-0');
+            setTimeout(() => banner.classList.add('translate-y-20', 'opacity-0'), 2500);
+        }
+
+        window.showModal = (id) => { document.getElementById(id).classList.remove('hidden'); };
+        window.hideModal = (id) => { document.getElementById(id).classList.add('hidden'); };
+        
+        window.exportCSV = () => {
+            if (filteredRecords.length === 0) {
+                showMessage("Sin datos para exportar", "error");
+                return;
+            }
+            const csv = ["Fecha,Pedido,Material,Tipo,Motivo,Cant,m2_Total", ...filteredRecords.map(r => [
+                r.timestamp && r.timestamp.seconds ? new Date(r.timestamp.seconds*1000).toLocaleDateString('es-ES') : '', 
+                `"${r.pedido}"`, 
+                `"${r.material}"`, 
+                `"${r.tipo}"`, 
+                `"${r.motivo}"`,
+                r.cantidad || 1,
+                r.m2
+            ].join(","))].join("\n");
+            
+            const blob = new Blob(["\ufeff" + csv], { type: 'text/csv;charset=utf-8;' });
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a'); 
+            a.href = url; 
+            a.download = `randal_analytics_${new Date().toISOString().split('T')[0]}.csv`; 
+            a.click();
+        };
+
+        window.openListsManager = () => { renderManageableLists(); showModal('lists-modal'); };
+        function renderManageableLists() {
+            const cMot = document.getElementById('manage-motivos');
+            const cMat = document.getElementById('manage-materiales');
+            cMot.innerHTML = persistedReasons.length ? persistedReasons.map(i => `<div class="flex justify-between items-center p-2 bg-slate-50 rounded-lg mb-1.5 text-[10px] font-semibold border border-slate-100"><span>${i.name}</span><button onclick="deleteDic('motivos_lista','${i.id}')" class="text-red-500 hover:bg-red-50 px-1.5 py-0.5 rounded font-black">✕</button></div>`).join('') : '<p class="text-[9px] text-slate-400 italic">Vacío</p>';
+            cMat.innerHTML = persistedMaterials.length ? persistedMaterials.map(i => `<div class="flex justify-between items-center p-2 bg-slate-50 rounded-lg mb-1.5 text-[10px] font-semibold border border-slate-100"><span>${i.name}</span><button onclick="deleteDic('materiales_lista','${i.id}')" class="text-red-500 hover:bg-red-50 px-1.5 py-0.5 rounded font-black">✕</button></div>`).join('') : '<p class="text-[9px] text-slate-400 italic">Vacío</p>';
+        }
+        window.deleteDic = async (coll, id) => { 
+            if (!currentUser) return;
+            await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', coll, id)); 
+        };
+        
+        window.resetOperationalHistory = async () => {
+            if (!currentUser) return;
+            try {
+                const batch = writeBatch(db);
+                allRecords.forEach(r => batch.delete(doc(db, 'artifacts', appId, 'public', 'data', 'registros', r.id)));
+                await batch.commit();
+                hideModal('bulk-delete-modal');
+                showMessage("Historial borrado completamente");
+            } catch (e) {
+                console.error(e);
+                showMessage("Error al borrar historial", "error");
+            }
+        };
+    </script>
+</head>
+<body class="text-slate-800 antialiased bg-slate-50 pb-10">
+
+    <datalist id="list-materiales"></datalist>
+    <datalist id="list-motivos"></datalist>
+
+    <div id="msg-banner" class="fixed bottom-4 right-4 px-4 py-2.5 rounded-xl text-white font-bold shadow-xl transition-all translate-y-20 opacity-0 duration-300 pointer-events-none z-[100]"></div>
+
+    <!-- Modales -->
+    <div id="single-delete-modal" class="fixed inset-0 z-[100] hidden flex items-center justify-center bg-slate-900/40 backdrop-blur-sm px-4">
+        <div class="bg-white p-5 rounded-2xl shadow-2xl max-w-xs w-full text-center border border-slate-100">
+            <h3 class="font-bold text-sm text-slate-900">¿Eliminar registro?</h3>
+            <p class="text-[10px] text-slate-400 mt-1">Esta acción no se puede deshacer.</p>
+            <div class="flex gap-2 mt-4">
+                <button onclick="hideModal('single-delete-modal')" class="flex-1 py-2 text-xs bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-lg font-bold transition">Cancelar</button>
+                <button onclick="deleteSingle()" class="flex-1 py-2 text-xs bg-red-600 hover:bg-red-700 text-white rounded-lg font-bold shadow-md transition">Sí, borrar</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="lists-modal" class="fixed inset-0 z-[100] hidden flex items-center justify-center bg-slate-900/60 backdrop-blur-sm px-4">
+        <div class="bg-white p-5 rounded-2xl shadow-2xl max-w-lg w-full flex flex-col max-h-[80vh] border border-slate-100">
+            <div class="flex justify-between items-center mb-4 border-b pb-2 border-slate-100">
+                <h3 class="font-bold text-sm text-slate-900">Gestión de Diccionarios</h3>
+                <button onclick="hideModal('lists-modal')" class="text-slate-400 hover:text-slate-600 p-1">✕</button>
+            </div>
+            <div class="grid grid-cols-2 gap-4 overflow-y-auto custom-scrollbar pr-2">
+                <div>
+                    <h4 class="text-[9px] font-black text-blue-600 uppercase mb-2">Motivos Frecuentes</h4>
+                    <div id="manage-motivos"></div>
+                </div>
+                <div>
+                    <h4 class="text-[9px] font-black text-amber-600 uppercase mb-2">Materiales Guardados</h4>
+                    <div id="manage-materiales"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="bulk-delete-modal" class="fixed inset-0 z-[100] hidden flex items-center justify-center bg-slate-900/60 backdrop-blur-sm px-4">
+        <div class="bg-white p-6 rounded-2xl shadow-2xl max-w-xs w-full text-center border border-slate-100">
+            <div class="w-10 h-10 bg-red-100 text-red-600 rounded-full flex items-center justify-center mx-auto mb-3">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" stroke-width="2"/></svg>
+            </div>
+            <h3 class="font-bold text-sm text-slate-900">¿Limpiar todo el historial?</h3>
+            <p class="text-[10px] text-slate-400 mt-1">Se borrarán todos los registros de mermas y rechazos permanentemente.</p>
+            <div class="flex gap-2 mt-5">
+                <button onclick="hideModal('bulk-delete-modal')" class="flex-1 py-2 text-xs bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-lg font-bold">Cancelar</button>
+                <button onclick="resetOperationalHistory()" class="flex-1 py-2 text-xs bg-red-600 hover:bg-red-700 text-white rounded-lg font-bold shadow-md">Confirmar</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Navegación -->
+    <nav class="bg-white border-b border-slate-200 px-4 py-2.5 flex justify-between items-center sticky top-0 z-40 shadow-sm">
+        <div class="flex items-center gap-2">
+            <div class="bg-blue-600 p-1.5 rounded-lg text-white shadow-sm">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-width="2.5" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/></svg>
+            </div>
+            <div>
+                <h1 class="font-bold text-xs leading-none text-slate-900">Randal Analytics <span class="text-blue-600 font-black">Pro M2</span></h1>
+                <p id="user-info" class="text-[8px] text-slate-400 font-bold mt-0.5">Conectando...</p>
+            </div>
+        </div>
+        <div class="flex items-center gap-2">
+            <button onclick="openListsManager()" title="Gestión de Listas" class="text-slate-400 hover:text-blue-600 p-1 rounded-lg hover:bg-slate-100">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg>
+            </button>
+            <button onclick="showModal('bulk-delete-modal')" title="Borrar Historial" class="text-slate-300 hover:text-red-500 p-1 rounded-lg hover:bg-slate-100">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" stroke-width="2"/></svg>
+            </button>
+            <button onclick="exportCSV()" class="bg-slate-900 hover:bg-slate-800 text-white px-3 py-1.5 rounded-lg text-[9px] font-black uppercase tracking-wider shadow-sm transition">CSV</button>
+        </div>
+    </nav>
+
+    <!-- Contenido Principal -->
+    <main class="max-w-6xl mx-auto p-3 grid grid-cols-1 lg:grid-cols-12 gap-4">
+        
+        <!-- Formulario e Impacto -->
+        <div class="lg:col-span-4 space-y-4">
+            <section class="glass-card rounded-2xl p-4">
+                <div class="flex justify-between items-center mb-3">
+                    <h2 class="font-bold text-slate-800 text-[10px] uppercase tracking-wider">Nuevo Registro</h2>
+                    <button id="btn-cancel" onclick="cancelEdit()" class="text-[9px] text-red-500 font-bold hidden hover:underline">CANCELAR</button>
+                </div>
+                <div class="grid grid-cols-2 gap-2.5">
+                    <div class="col-span-2 sm:col-span-1">
+                        <label class="text-[9px] font-bold text-slate-400 uppercase">Fecha</label>
+                        <input type="date" id="f_fecha" class="w-full mt-0.5 px-2.5 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500">
+                    </div>
+                    <div class="col-span-2 sm:col-span-1">
+                        <label class="text-[9px] font-bold text-slate-400 uppercase">Pedido / OF</label>
+                        <input type="text" id="f_pedido" placeholder="#" class="w-full mt-0.5 px-2.5 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500">
+                    </div>
+                    <div class="col-span-2 sm:col-span-1">
+                        <label class="text-[9px] font-bold text-blue-600 uppercase">m² Por Pieza *</label>
+                        <input type="number" step="0.0001" id="f_m2" placeholder="Ej. 1.25" class="w-full mt-0.5 px-2.5 py-1.5 bg-blue-50/50 border border-blue-200 rounded-lg text-xs font-bold text-blue-900 outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500">
+                    </div>
+                    <div class="col-span-1 sm:col-span-1">
+                        <label class="text-[9px] font-bold text-slate-400 uppercase">Cant.</label>
+                        <input type="number" id="f_cantidad" value="1" min="1" class="w-full mt-0.5 px-2.5 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs font-bold outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500">
+                    </div>
+                    <div class="col-span-2 sm:col-span-2">
+                        <label class="text-[9px] font-bold text-slate-400 uppercase">Tipo</label>
+                        <select id="f_tipo" class="w-full mt-0.5 px-2 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs font-bold outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500">
+                            <option value="Merma">Merma</option>
+                            <option value="Rechazo">Rechazo</option>
+                        </select>
+                    </div>
+                    <div class="col-span-2">
+                        <label class="text-[9px] font-bold text-slate-400 uppercase">Material</label>
+                        <input type="text" id="f_material" list="list-materiales" placeholder="Seleccionar o escribir..." class="w-full mt-0.5 px-2.5 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500">
+                    </div>
+                    <div class="col-span-2">
+                        <label class="text-[9px] font-bold text-slate-400 uppercase">Motivo *</label>
+                        <input type="text" id="f_motivo" list="list-motivos" placeholder="¿Cuál fue el motivo?" class="w-full mt-0.5 px-2.5 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500">
+                    </div>
+                    <div class="col-span-2 hidden">
+                        <textarea id="f_notas"></textarea>
+                    </div>
+                </div>
+                <button onclick="saveData()" class="w-full mt-3.5 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-black text-[10px] uppercase tracking-widest shadow-md active:scale-[0.98] transition-all">
+                    <span id="submit-text">REGISTRAR</span>
+                </button>
+            </section>
+
+            <!-- Impacto Calculadora -->
+            <section class="glass-card rounded-2xl p-4">
+                <div class="flex items-center justify-between mb-2">
+                    <h3 class="font-bold text-[9px] uppercase tracking-wider text-slate-400">Impacto s/ Material Total</h3>
+                    <div id="calc-result" class="text-base font-black text-blue-600">0.0%</div>
+                </div>
+                <div class="flex gap-2 mb-2">
+                    <select id="calc_mat" onchange="updateImpact()" class="flex-1 px-2 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-[10px] font-bold outline-none"></select>
+                    <input type="number" id="calc_total" oninput="updateImpact()" placeholder="Total m²" class="w-24 px-2 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-[10px] font-bold outline-none">
+                </div>
+                <div class="h-14 relative flex items-center justify-center">
+                    <canvas id="impactChart"></canvas>
+                </div>
+            </section>
+        </div>
+
+        <!-- Dashboard -->
+        <div class="lg:col-span-8 space-y-4">
+            
+            <!-- Selector de Periodo y KPIs -->
+            <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-white p-3 rounded-2xl border border-slate-200 shadow-sm">
+                <div>
+                    <span id="current-period-label" class="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Historial</span>
+                    <span class="text-xs font-extrabold text-slate-800">Resumen Operativo</span>
+                </div>
+                <div class="flex items-center gap-2">
+                    <label for="month-filter-select" class="text-[9px] font-bold text-slate-400 uppercase">Filtrar:</label>
+                    <select id="month-filter-select" onchange="setMonthFilter(this.value)" class="px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-slate-700 outline-none focus:ring-2 focus:ring-blue-500/20">
+                        <option value="all">Todo el Historial</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-3 gap-3">
+                <div class="glass-card p-3 rounded-2xl flex flex-col items-center justify-center text-center">
+                    <span class="text-[8px] font-bold text-amber-500 uppercase tracking-wider">Merma (m²)</span>
+                    <span id="stat-merma" class="text-xl font-black text-slate-900 leading-none mt-1">0.00</span>
+                </div>
+                <div class="glass-card p-3 rounded-2xl flex flex-col items-center justify-center text-center">
+                    <span class="text-[8px] font-bold text-red-500 uppercase tracking-wider">Rechazo (m²)</span>
+                    <span id="stat-rechazo" class="text-xl font-black text-slate-900 leading-none mt-1">0.00</span>
+                </div>
+                <div class="glass-card p-3 rounded-2xl flex flex-col items-center justify-center text-center bg-blue-50/50 border-blue-100">
+                    <span class="text-[8px] font-bold text-blue-600 uppercase tracking-wider">Total Pérdida</span>
+                    <div class="flex items-baseline gap-0.5 mt-1">
+                        <span id="stat-total" class="text-xl font-black text-blue-700 leading-none">0.00</span>
+                        <span class="text-[10px] font-bold text-blue-500">m²</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Gráficos y Distribución -->
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div class="glass-card p-4 rounded-2xl flex flex-col">
+                    <h3 class="text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-2">Distribución de Motivos (m²)</h3>
+                    <div class="h-40 relative flex items-center justify-center">
+                        <canvas id="motivosChart"></canvas>
+                    </div>
+                </div>
+
+                <div class="glass-card p-4 rounded-2xl flex flex-col justify-between">
+                    <div>
+                        <h3 class="text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-2">Desglose por Tipo</h3>
+                        <div id="percent-tipos" class="mb-3"></div>
+                    </div>
+                    <div>
+                        <h3 class="text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-2">Top Motivos por m²</h3>
+                        <div id="percent-motivos"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Frecuencia -->
+            <div class="glass-card p-4 rounded-2xl">
+                <h3 class="text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-2">Frecuencia Incidencias (Top Motivos)</h3>
+                <div id="frequency-grid" class="grid grid-cols-3 gap-2"></div>
+            </div>
+
+            <!-- Tabla de Registros -->
+            <div class="glass-card rounded-2xl overflow-hidden">
+                <div class="p-3 bg-slate-50 border-b border-slate-100 flex justify-between items-center">
+                    <h3 class="text-[9px] font-bold text-slate-500 uppercase tracking-wider">Últimos Registros</h3>
+                    <span class="text-[9px] text-slate-400 font-semibold">Mostrando actual</span>
+                </div>
+                <div class="overflow-x-auto max-h-64 custom-scrollbar">
+                    <table class="w-full text-left border-collapse">
+                        <thead class="bg-slate-50 text-[8px] font-bold text-slate-400 uppercase sticky top-0 border-b border-slate-100">
+                            <tr>
+                                <th class="p-2">Pedido / Fecha</th>
+                                <th class="p-2">Material / Motivo</th>
+                                <th class="p-2 text-right">Sup. m²</th>
+                                <th class="p-2 text-right">Acción</th>
+                            </tr>
+                        </thead>
+                        <tbody id="table-body">
+                            <tr><td colspan="4" class="p-6 text-center text-slate-400 text-xs italic">Cargando datos...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+        </div>
+    </main>
+
+</body>
+</html>
